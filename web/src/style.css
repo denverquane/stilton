@@ -987,6 +987,71 @@ body {
   grid-column: 1 / -1;
 }
 
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.chip.removable:hover {
+  border-color: #b5524e;
+}
+
+.chip.removing {
+  border-color: #b5524e;
+  color: #f0a39f;
+  text-decoration: line-through;
+}
+
+.import-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.75rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.import-include input {
+  margin-top: 0.25rem;
+  accent-color: var(--accent);
+}
+
+.import-row .dupe-body > span {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.875rem;
+}
+
+.toggle.disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.notice a {
+  color: var(--accent);
+}
+
+.plate-bar {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.plate-bar .chip {
+  background: rgb(0 0 0 / 0.55);
+}
+
+.stage .loading {
+  background: rgb(30 33 39 / 0.6);
+}
+
 @media (max-width: 800px) {
   .collection-details {
     grid-template-columns: 1fr;

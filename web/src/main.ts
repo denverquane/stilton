@@ -92,6 +92,7 @@ const viewControls = h(
 );
 const details = h('section', { class: 'collection-details' });
 const notice = h('p', { class: 'notice', hidden: true });
+const importNotice = h('p', { class: 'notice', hidden: true });
 const tagBar = h('nav', { class: 'tags' });
 const grid = h('main', { class: 'grid' });
 const moreButton = h('button', { class: 'button more', hidden: true }, 'Load more');
@@ -110,6 +111,7 @@ const selectionBar = h(
   { class: 'selection-bar', hidden: true },
   selectionCount,
   renameButton,
+  h('button', { class: 'button', onclick: () => openBulkTags() }, 'Tag…'),
   moveButton,
   h('span', { class: 'sep' }, 'or'),
   folderName,
@@ -126,6 +128,7 @@ const browse = h(
   details,
   tagBar,
   notice,
+  importNotice,
   grid,
   moreButton,
   selectionBar,
@@ -180,6 +183,7 @@ async function loadView(key: number | 'root') {
   if (moved) window.scrollTo(0, 0);
   renderCrumbs();
   renderDetails();
+  renderImportNotice();
   await loadModels();
 }
 
@@ -624,6 +628,71 @@ async function openDelete() {
   );
 }
 
+/** Dialog for adding and removing tags on the whole selection. */
+function openBulkTags() {
+  const items = [...state.selected.values()];
+  // Direct tags of the selected items, from what's on screen. Tags a model
+  // inherits from a folder above can't be removed from the model itself.
+  const tagsOf = (it: Item) =>
+    it.kind === 'm'
+      ? (state.models.find((m) => m.id === it.id)?.tags ?? [])
+      : (state.view?.children.find((c) => c.id === it.id)?.tags ?? []);
+  const counts = new Map<string, number>();
+  for (const it of items) for (const t of tagsOf(it)) counts.set(t, (counts.get(t) ?? 0) + 1);
+
+  const remove = new Set<string>();
+  const addInput = h('input', { class: 'field-input', placeholder: 'Comma separated, e.g. printed, PETG' });
+  const error = h('p', { class: 'field-error', hidden: true });
+  const save = h('button', { class: 'button primary' }, 'Apply');
+  const existing = [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([tag, n]) => {
+    const chip = h('button', { class: 'chip removable', title: 'Click to remove from all selected items' }, `${tag} · ${n} of ${items.length}`);
+    chip.addEventListener('click', () => {
+      if (remove.has(tag)) remove.delete(tag);
+      else remove.add(tag);
+      chip.classList.toggle('removing', remove.has(tag));
+    });
+    return chip;
+  });
+
+  const submit = async () => {
+    const add = addInput.value.split(',').map((t) => t.trim()).filter(Boolean);
+    if (add.length === 0 && remove.size === 0) return closePicker();
+    save.disabled = true;
+    try {
+      await api.bulkTags(selectionIds(items), add, [...remove]);
+      closePicker();
+      loadTags();
+      await loadView(state.viewKey ?? 'root');
+      const parts = [add.length && `added ${add.join(', ')}`, remove.size && `removed ${[...remove].join(', ')}`].filter(Boolean);
+      status.textContent = `Tags ${parts.join('; ')} on ${plural(items.length, 'item')}`;
+    } catch (err) {
+      error.textContent = err instanceof api.ApiError ? err.detail : (err as Error).message;
+      error.hidden = false;
+      save.disabled = false;
+    }
+  };
+  save.addEventListener('click', submit);
+  addInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submit();
+  });
+
+  picker.replaceChildren(
+    h(
+      'div',
+      { class: 'picker' },
+      h('h2', {}, `Tag ${plural(items.length, 'item')}`),
+      h('label', { class: 'field' }, h('span', {}, 'Add tags'), addInput),
+      ...(existing.length
+        ? [h('div', { class: 'field' }, h('span', {}, 'Current tags (click to remove)'), h('div', { class: 'chip-row' }, ...existing))]
+        : []),
+      error,
+      h('div', { class: 'picker-actions' }, h('button', { class: 'button', onclick: () => closePicker() }, 'Cancel'), save),
+    ),
+  );
+  picker.hidden = false;
+  addInput.focus();
+}
+
 /** Dialog for renaming a single model file or folder. */
 function openRename(item: Item) {
   const input = h('input', { class: 'field-input', value: item.name });
@@ -881,6 +950,7 @@ function editableFields(item: Editable, save: (patch: api.Patch) => Promise<Edit
 
 async function openModel(id: number) {
   const m = await api.getModel(id);
+  viewerPlate = undefined;
   // Deep link: show the model's folder behind the dialog.
   if (!state.view) showCollection(m.collectionId);
 
@@ -915,6 +985,7 @@ async function openModel(id: number) {
           h('dt', {}, 'Size'), h('dd', {}, formatBytes(m.size)),
           h('dt', {}, 'Modified'), h('dd', {}, new Date(m.mtime * 1000).toLocaleString()),
           h('dt', {}, 'Downloads'), h('dd', {}, downloadSummary(m)),
+          ...(m.kind === 'model' ? [h('dt', {}, 'Up axis'), h('dd', {}, upSelect(m))] : []),
         ),
         ...editableFields(m, async (patch) => {
           const updated = await api.patchModel(m.id, patch);
@@ -956,18 +1027,76 @@ async function openModel(id: number) {
 }
 
 /**
- * Loads the original file; for 3MFs three.js can't assemble (e.g. Bambu
- * Studio's multi-part packages), falls back to the server's merged STL.
+ * Picks which axis of a model points up. Changing it re-renders the
+ * thumbnail and reloads the 3D view in the new orientation.
  */
-async function loadInto(v: Viewer, m: Model): Promise<boolean> {
-  const data = await fetchBytes(api.fileURL(m.id));
-  if (m.format !== '3mf') return v.load(data, m.format);
-  try {
-    if (v.load(data, '3mf')) return true;
-  } catch (err) {
-    console.warn('3MFLoader failed, using server-merged mesh', err);
-  }
-  return v.load(await fetchBytes(api.meshURL(m.id)), 'stl');
+function upSelect(m: Model) {
+  const select = h(
+    'select',
+    { class: 'field-input sort-select' },
+    ...(['+z', '-z', '+y', '-y', '+x', '-x'] as const).map((up) =>
+      h('option', { value: up }, `${up.toUpperCase()}${up === '+z' ? ' (default)' : ''}`),
+    ),
+  );
+  select.value = m.up || '+z';
+  select.addEventListener('change', async () => {
+    try {
+      const updated = await api.patchModel(m.id, { up: select.value as api.Up });
+      m.up = updated.up;
+      if (viewer) loadInto(viewer, m);
+      if (state.viewKey !== undefined) loadModels(); // the card's thumbnail re-renders
+    } catch (err) {
+      showToast(err instanceof api.ApiError ? err.detail : (err as Error).message, true);
+      select.value = m.up || '+z';
+    }
+  });
+  return select;
+}
+
+/** The plate shown for a multi-plate project; undefined means the first. */
+let viewerPlate: number | undefined;
+
+/**
+ * Loads a model into the viewer. STLs and OBJs load from the original file;
+ * 3MFs load the server's mesh, which has the same colors as the thumbnail
+ * and, for multi-plate projects, one plate at a time.
+ */
+async function loadInto(v: Viewer, m: Model, plate = viewerPlate): Promise<boolean> {
+  if (m.format !== '3mf') return v.load(await fetchBytes(api.fileURL(m.id)), m.format, m.up);
+
+  const res = await fetch(api.meshURL(m.id, plate));
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  const plates = (res.headers.get('X-Plates') ?? '').split(',').filter(Boolean).map(Number);
+  viewerPlate = Number(res.headers.get('X-Plate') ?? 0);
+  const ok = v.load(await res.arrayBuffer(), 'ply', m.up);
+  renderPlates(v, m, plates);
+  return ok;
+}
+
+/** Plate buttons over the viewer, for projects with more than one plate. */
+function renderPlates(v: Viewer, m: Model, plates: number[]) {
+  const stage = modal.querySelector<HTMLElement>('.stage');
+  stage?.querySelector('.plate-bar')?.remove();
+  if (!stage || plates.length < 2) return;
+  const button = (n: number, label: string) => {
+    const b = h('button', { class: `chip${n === viewerPlate ? ' active' : ''}` }, label);
+    b.addEventListener('click', async () => {
+      if (n === viewerPlate) return;
+      const loading = h('div', { class: 'loading' }, `Loading ${label.toLowerCase()}…`);
+      stage.append(loading);
+      try {
+        await loadInto(v, m, n);
+      } catch (err) {
+        showToast(`Couldn't load ${label.toLowerCase()}: ${(err as Error).message}`, true);
+      } finally {
+        loading.remove();
+      }
+    });
+    return b;
+  };
+  stage.append(
+    h('div', { class: 'plate-bar' }, ...plates.map((n) => button(n, `Plate ${n}`)), button(0, 'All plates')),
+  );
 }
 
 async function fetchBytes(url: string) {
@@ -1217,6 +1346,122 @@ function trashBatch(b: api.TrashBatch) {
   );
 }
 
+// ---- Manyfold import ---------------------------------------------------------
+
+/** Folders the user has reviewed or dismissed, by path. Remembered. */
+const reviewedImports = new Set<string>(JSON.parse(localStorage.getItem('stilton.manyfoldReviewed') ?? '[]'));
+function markReviewed(paths: string[]) {
+  for (const p of paths) reviewedImports.add(p);
+  localStorage.setItem('stilton.manyfoldReviewed', JSON.stringify([...reviewedImports]));
+}
+
+/** At the library root, offer to import Manyfold metadata not yet reviewed. */
+async function renderImportNotice() {
+  importNotice.hidden = true;
+  if (state.view?.collection.parentId !== null) return;
+  const pending = (await api.manyfoldPreview()).filter((m) => !reviewedImports.has(m.path));
+  if (pending.length === 0 || state.view?.collection.parentId !== null) return;
+  const dismiss = h('a', { href: '#' }, 'Dismiss');
+  dismiss.addEventListener('click', (e) => {
+    e.preventDefault();
+    markReviewed(pending.map((m) => m.path));
+    importNotice.hidden = true;
+  });
+  importNotice.replaceChildren(
+    `Found Manyfold metadata in ${plural(pending.length, 'folder')}. `,
+    h('a', { href: '#/import' }, 'Review import'),
+    ' · ',
+    dismiss,
+  );
+  importNotice.hidden = false;
+}
+
+async function showImport() {
+  showPage();
+  const items = await api.manyfoldPreview();
+  status.textContent = `${plural(items.length, 'folder')} with Manyfold metadata`;
+
+  const rows = items.map((m) => {
+    const include = h('input', { type: 'checkbox', checked: true });
+    const canRename = !!m.title && !m.renameError;
+    const rename = h('input', { type: 'checkbox', checked: false, disabled: !canRename });
+    const changes = [
+      m.addTags.length > 0 && h('span', {}, 'Add tags ', ...m.addTags.map((t) => h('span', { class: 'chip small' }, t))),
+      m.sourceUrl && h('span', {}, 'Set source ', h('code', {}, m.sourceUrl)),
+      m.orient.length > 0 &&
+        h('span', { title: m.orient.map((o) => `${o.path}: ${o.up}`).join('\n') }, `Set the up axis of ${plural(m.orient.length, 'file')}`),
+    ].filter((x): x is HTMLSpanElement => !!x);
+    const row = h(
+      'article',
+      { class: 'import-row' },
+      h('label', { class: 'import-include' }, include),
+      h(
+        'div',
+        { class: 'dupe-body' },
+        h('h3', {}, m.path),
+        ...changes,
+        m.title
+          ? h(
+              'label',
+              { class: `toggle${canRename ? '' : ' disabled'}` },
+              rename,
+              'Rename folder to ',
+              h('strong', {}, `“${m.title}”`),
+              m.renameError ? h('span', { class: 'field-error' }, ` (${m.renameError})`) : '',
+            )
+          : '',
+        changes.length === 0 && !canRename ? h('span', { class: 'dupe-meta' }, 'Nothing to import') : '',
+      ),
+    );
+    return { m, include, rename, row };
+  });
+
+  const apply = h('button', { class: 'button primary', disabled: rows.length === 0 }, 'Import selected');
+  const renameAll = h('input', { type: 'checkbox' });
+  renameAll.addEventListener('change', () => {
+    for (const r of rows) if (!r.rename.disabled) r.rename.checked = renameAll.checked;
+  });
+  const result = h('p', { class: 'field-error', hidden: true });
+  apply.addEventListener('click', async () => {
+    const chosen = rows.filter((r) => r.include.checked);
+    if (chosen.length === 0) return;
+    apply.disabled = true;
+    try {
+      const results = await api.manyfoldApply(chosen.map((r) => ({ collectionId: r.m.collectionId, rename: r.rename.checked })));
+      markReviewed(chosen.map((r) => r.m.path));
+      state.viewKey = undefined; // folders may have been renamed; reload when browsing again
+      loadTags();
+      const failed = results.filter((r) => r.error);
+      showToast(
+        failed.length
+          ? `Imported ${chosen.length - failed.length}; ${failed.length} had problems: ${failed.map((f) => `${f.path}: ${f.error}`).join('; ')}`
+          : `Imported ${plural(chosen.length, 'folder')}`,
+        failed.length > 0,
+      );
+      showImport();
+    } catch (err) {
+      result.textContent = err instanceof api.ApiError ? err.detail : (err as Error).message;
+      result.hidden = false;
+      apply.disabled = false;
+    }
+  });
+
+  page.replaceChildren(
+    h('div', { class: 'page-head' }, h('h2', {}, 'Import from Manyfold'), apply),
+    h(
+      'p',
+      { class: 'dupes-intro' },
+      'These folders have a ',
+      h('code', {}, 'datapackage.json'),
+      ' from Manyfold. Importing adds its keywords as folder tags and its first link as the source (only if the folder has none), and can rename the folder to its Manyfold title. Manyfold’s own markers like “!new”, and its homepage (a link to the Manyfold instance itself), are ignored.',
+    ),
+    ...(rows.length
+      ? [h('label', { class: 'toggle' }, renameAll, 'Rename all folders to their titles'), ...rows.map((r) => r.row)]
+      : [h('p', { class: 'empty' }, 'Nothing left to import.')]),
+    result,
+  );
+}
+
 // ---- routing ----------------------------------------------------------------
 //
 //   #/            library root
@@ -1224,11 +1469,13 @@ function trashBatch(b: api.TrashBatch) {
 //   #/model/<id>  a model, shown over its folder
 //   #/duplicates  sets of identical files to resolve
 //   #/trash       deleted items to restore or purge
+//   #/import      Manyfold metadata to import
 
 function route() {
-  if (location.hash === '#/duplicates' || location.hash === '#/trash') {
+  if (['#/duplicates', '#/trash', '#/import'].includes(location.hash)) {
     closeModel();
     if (location.hash === '#/trash') showTrash();
+    else if (location.hash === '#/import') showImport();
     else showDuplicates();
     return;
   }

@@ -50,6 +50,11 @@ func (s *Scanner) RenameModel(ctx context.Context, id int64, name string) error 
 func (s *Scanner) RenameCollection(ctx context.Context, id int64, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.renameCollection(ctx, id, name)
+}
+
+// renameCollection is RenameCollection for callers already holding s.mu.
+func (s *Scanner) renameCollection(ctx context.Context, id int64, name string) error {
 
 	c, err := s.DB.GetCollection(ctx, id)
 	if err != nil {

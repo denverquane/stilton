@@ -1,5 +1,6 @@
 // Package thumbnail renders model previews and stores them as PNGs keyed by
-// content hash, so identical files share one thumbnail and URLs never go stale.
+// content hash and orientation (db.ThumbKey), so identical files share one
+// thumbnail and URLs never go stale.
 package thumbnail
 
 import (
@@ -16,6 +17,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,15 +41,17 @@ var (
 	fovy    = 30.0
 	viewDir = fauxgl.V(2, -3, 2.2).Normalize() // front-right and above; models are Z-up
 	center  = fauxgl.V(0, 0, 0)
-	up      = fauxgl.V(0, 0, 1)
+	worldUp = fauxgl.V(0, 0, 1)
 	light   = fauxgl.V(1, -1.5, 2).Normalize()
 
 	background = fauxgl.HexColor("#1e2127")
-	modelColor = fauxgl.HexColor("#e8a33d")
 )
 
-// Render draws a mesh centered in a square frame.
-func Render(m *fauxgl.Mesh) image.Image {
+// Render draws a mesh centered in a square frame, turned so that its up
+// axis (see mesh.UpMatrix) points up. A colored mesh (see mesh.LoadPreview)
+// is drawn in its vertex colors, otherwise in mesh.DefaultColor.
+func Render(m *fauxgl.Mesh, up string, colored bool) image.Image {
+	m.Transform(mesh.UpMatrix(up))
 	m.BiUnitCube()
 	m.SmoothNormalsThreshold(fauxgl.Radians(30))
 
@@ -64,9 +68,15 @@ func Render(m *fauxgl.Mesh) image.Image {
 	ctx := fauxgl.NewContext(px, px)
 	ctx.ClearColorBufferWith(background)
 
-	matrix := fauxgl.LookAt(eye, center, up).Perspective(fovy, 1, 0.1, 20)
+	matrix := fauxgl.LookAt(eye, center, worldUp).Perspective(fovy, 1, 0.1, 20)
 	shader := fauxgl.NewPhongShader(matrix, light, eye)
-	shader.ObjectColor = modelColor
+	shader.ObjectColor = mesh.DefaultColor
+	if colored {
+		shader.ObjectColor = fauxgl.Discard // use the vertex colors
+		for _, t := range m.Triangles {
+			t.V1.Color, t.V2.Color, t.V3.Color = mesh.DisplayColor(t.V1.Color), mesh.DisplayColor(t.V2.Color), mesh.DisplayColor(t.V3.Color)
+		}
+	}
 	shader.AmbientColor = fauxgl.Gray(0.35)
 	shader.SpecularColor = fauxgl.Gray(0.25)
 	shader.SpecularPower = 24
@@ -102,7 +112,7 @@ func fit(src image.Image, size int) image.Image {
 type Generator struct {
 	db          *db.DB
 	libraryRoot string
-	dir         string // output directory for <hash>.png
+	dir         string // output directory for <thumb key>.png
 	workers     int
 	wake        chan struct{}
 	sweepMu     sync.Mutex
@@ -118,8 +128,8 @@ func NewGenerator(database *db.DB, libraryRoot, dir string, workers int) *Genera
 	}
 }
 
-func (g *Generator) Path(hash string) string {
-	return filepath.Join(g.dir, hash+".png")
+func (g *Generator) Path(key string) string {
+	return filepath.Join(g.dir, key+".png")
 }
 
 // Wake asks the generator to look for pending work. It never blocks.
@@ -157,7 +167,7 @@ func (g *Generator) drain(ctx context.Context) {
 			return
 		}
 
-		// Identical files share a hash; render each hash once per batch.
+		// Identical files in the same orientation share a thumbnail; render each once per batch.
 		jobs := make(chan db.Model)
 		var wg sync.WaitGroup
 		var saved atomic.Int32
@@ -172,8 +182,8 @@ func (g *Generator) drain(ctx context.Context) {
 		}
 		seen := map[string]bool{}
 		for _, m := range pending {
-			if !seen[m.Hash] {
-				seen[m.Hash] = true
+			if !seen[m.ThumbKey] {
+				seen[m.ThumbKey] = true
 				jobs <- m
 			}
 		}
@@ -192,7 +202,7 @@ func (g *Generator) process(ctx context.Context, m db.Model) bool {
 		state, msg = db.ThumbFailed, err.Error()
 		slog.Warn("thumbnail failed", "path", m.Path, "err", err)
 	}
-	if err := g.db.SetThumbState(ctx, m.Hash, state, msg); err != nil {
+	if err := g.db.SetThumbState(ctx, m.ThumbKey, state, msg); err != nil {
 		slog.Error("thumbnail: save state", "path", m.Path, "err", err)
 		return false
 	}
@@ -200,7 +210,7 @@ func (g *Generator) process(ctx context.Context, m db.Model) bool {
 }
 
 func (g *Generator) generate(m db.Model) error {
-	out := g.Path(m.Hash)
+	out := g.Path(m.ThumbKey)
 	if _, err := os.Stat(out); err == nil {
 		return nil // already rendered for an identical file
 	}
@@ -213,20 +223,18 @@ func (g *Generator) generate(m db.Model) error {
 		}
 		return writePNG(out, fit(img, Size))
 	}
-	var img image.Image
-	if m.Format == "3mf" {
-		if embedded, ok := mesh.EmbeddedThumbnail(src); ok {
-			img = fit(embedded, Size)
+	l, err := mesh.LoadPreview(src, m.Format)
+	if err != nil {
+		// A slicer's own preview is better than nothing, though it won't
+		// match the others.
+		if m.Format == "3mf" {
+			if embedded, ok := mesh.EmbeddedThumbnail(src); ok {
+				return writePNG(out, fit(embedded, Size))
+			}
 		}
+		return err
 	}
-	if img == nil {
-		mm, err := mesh.Load(src, m.Format)
-		if err != nil {
-			return err
-		}
-		img = Render(mm)
-	}
-	return writePNG(out, img)
+	return writePNG(out, Render(l.Mesh, m.Up, l.Colored))
 }
 
 // maxImagePixels bounds decoded image size; a 30k×30k photo would need gigabytes.
@@ -253,7 +261,57 @@ func loadImage(path string) (image.Image, error) {
 	return img, err
 }
 
-// Sweep deletes thumbnails whose hash isn't in the set returned by keep,
+// Version identifies how thumbnails are rendered. Bump it when rendering
+// changes: existing thumbnails are then deleted and re-rendered, and the
+// version in thumbnail URLs makes browsers fetch the new images.
+const Version = 3
+
+// IsKey reports whether s is a thumbnail key (see db.ThumbKey): 64 lowercase
+// hex digits, optionally followed by an orientation like "_py".
+func IsKey(s string) bool {
+	hash, suffix, hasSuffix := strings.Cut(s, "_")
+	if len(hash) != 64 || strings.Trim(hash, "0123456789abcdef") != "" {
+		return false
+	}
+	switch suffix {
+	case "nz", "py", "ny", "px", "nx":
+		return true
+	}
+	return !hasSuffix
+}
+
+// EnsureVersion clears out thumbnails rendered by an older Version. Call it
+// before the generator and sweeps start.
+func (g *Generator) EnsureVersion(ctx context.Context) error {
+	if err := os.MkdirAll(g.dir, 0o755); err != nil {
+		return err
+	}
+	marker := filepath.Join(g.dir, ".version")
+	if data, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(data)) == strconv.Itoa(Version) {
+		return nil
+	}
+	entries, err := os.ReadDir(g.dir)
+	if err != nil {
+		return err
+	}
+	removed := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".png") {
+			if err := os.Remove(filepath.Join(g.dir, e.Name())); err == nil {
+				removed++
+			}
+		}
+	}
+	if err := g.db.ResetThumbnails(ctx); err != nil {
+		return err
+	}
+	if removed > 0 {
+		slog.Info("thumbnail renderer changed; re-rendering", "removed", removed, "version", Version)
+	}
+	return os.WriteFile(marker, []byte(strconv.Itoa(Version)+"\n"), 0o644)
+}
+
+// Sweep deletes thumbnails whose key isn't in the set returned by keep,
 // and returns how many it removed. The directory is listed before keep is
 // called, so a thumbnail rendered for a model indexed meanwhile is never
 // mistaken for an orphan.
@@ -274,8 +332,8 @@ func (g *Generator) Sweep(ctx context.Context, keep func(context.Context) (map[s
 	}
 	removed := 0
 	for _, e := range entries {
-		hash, ok := strings.CutSuffix(e.Name(), ".png")
-		if !ok || len(hash) != 64 || keepSet[hash] {
+		key, ok := strings.CutSuffix(e.Name(), ".png")
+		if !ok || !IsKey(key) || keepSet[key] {
 			continue // not a thumbnail (e.g. an in-progress temp file), or still used
 		}
 		if err := os.Remove(filepath.Join(g.dir, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {

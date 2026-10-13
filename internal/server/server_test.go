@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -903,7 +905,7 @@ func TestThumbnailSweep(t *testing.T) {
 	e := newEnv(t, "A/keep.stl", "B/trashed.stl")
 	dir := t.TempDir()
 	g := thumbnail.NewGenerator(e.db, e.scanner.Root, dir, 1)
-	hashes, _ := e.db.AllHashes(context.Background())
+	hashes, _ := e.db.AllThumbKeys(context.Background())
 	var keep, trashed string
 	for h := range hashes {
 		models, _ := e.db.ModelsByHash(context.Background(), h)
@@ -923,8 +925,8 @@ func TestThumbnailSweep(t *testing.T) {
 	e.mustDo("POST", "/api/delete", string(b), nil)
 
 	keepFn := func(ctx context.Context) (map[string]bool, error) {
-		k, _ := e.db.AllHashes(ctx)
-		t, _ := e.scanner.TrashHashes()
+		k, _ := e.db.AllThumbKeys(ctx)
+		t, _ := e.scanner.TrashThumbKeys()
 		for h := range t {
 			k[h] = true
 		}
@@ -1091,5 +1093,327 @@ func TestDownloads(t *testing.T) {
 	e.mustDo("GET", "/api/downloads", "", &recent)
 	if len(recent) != 3 || recent[1].Path != "A/x.stl" || recent[1].ModelID != nil {
 		t.Errorf("after deleting x, downloads = %+v, want x's row kept with no model id", recent)
+	}
+}
+
+func TestBulkTags(t *testing.T) {
+	e := newEnv(t, "A/x.stl", "A/y.stl", "A/z.stl", "B/w.stl")
+	cols, _ := e.ids()
+	var a modelsResp
+	e.mustDo("GET", "/api/models?collection="+itoa(cols["A"]), "", &a)
+	var ids []int64
+	for _, m := range a.Models {
+		ids = append(ids, m.ID)
+		e.mustDo("PATCH", "/api/models/"+itoa(m.ID), `{"tags":["old","keep"]}`, nil)
+	}
+	e.mustDo("PATCH", "/api/collections/"+itoa(cols["B"]), `{"tags":["old"]}`, nil)
+
+	bulk := func(models, collections []int64, add, remove []string) int {
+		b, _ := json.Marshal(map[string]any{"models": models, "collections": collections, "add": add, "remove": remove})
+		return e.do("POST", "/api/tags/bulk", string(b), nil)
+	}
+	if code := bulk(ids, []int64{cols["B"]}, []string{"Printed", "printed", " x "}, []string{"OLD"}); code != http.StatusNoContent {
+		t.Fatalf("bulk: status %d", code)
+	}
+	e.mustDo("GET", "/api/models?collection="+itoa(cols["A"]), "", &a)
+	for _, m := range a.Models {
+		if !slices.Equal(m.Tags, []string{"keep", "Printed", "x"}) {
+			t.Errorf("%s tags = %v", m.Name, m.Tags)
+		}
+	}
+	var b collectionResp
+	e.mustDo("GET", "/api/collections/"+itoa(cols["B"]), "", &b)
+	if !slices.Equal(b.Collection.Tags, []string{"Printed", "x"}) {
+		t.Errorf("B tags = %v", b.Collection.Tags)
+	}
+	var tags []struct{ Name string }
+	e.mustDo("GET", "/api/tags", "", &tags)
+	for _, tg := range tags {
+		if tg.Name == "old" {
+			t.Error("unused tag old wasn't pruned")
+		}
+	}
+
+	if code := bulk(ids, []int64{db.RootCollectionID}, []string{"y"}, nil); code != http.StatusBadRequest {
+		t.Errorf("root: status %d, want 400", code)
+	}
+	if code := bulk(append(ids, 9999), nil, []string{"never"}, nil); code != http.StatusNotFound {
+		t.Errorf("missing id: status %d, want 404", code)
+	}
+	e.mustDo("GET", "/api/models?collection="+itoa(cols["A"]), "", &a)
+	if slices.Contains(a.Models[0].Tags, "never") {
+		t.Error("a refused bulk change was partly applied")
+	}
+}
+
+func TestManyfoldImport(t *testing.T) {
+	e := newEnv(t, "tank/t.stl", "broken/b.stl", "slashy/s.stl", "done/d.stl", "clash/c.stl", "Nice Clash/n.stl")
+	root := e.scanner.Root
+	write := func(rel, body string) {
+		os.WriteFile(filepath.Join(root, filepath.FromSlash(rel)), []byte(body), 0o644)
+	}
+	write("tank/datapackage.json", `{"title":"Nice Title","homepage":"http://localhost:3214/models/abc",
+		"resources":[{"path":"t.stl","up":"+Y"},{"path":"missing.stl","up":"+y"},{"path":"../escape.stl","up":"+y"}],
+		"keywords":["!new","tank","Military","tank"],
+		"links":[{"path":"ftp://nope"},{"path":"https://www.printables.com/model/1"},"https://other.example"]}`)
+	write("broken/datapackage.json", `{"title": "Broken",`)
+	write("slashy/datapackage.json", `{"title":"AC/DC Logo","keywords":["music"]}`)
+	write("done/datapackage.json", `{"title":"done","keywords":["!new"],"links":[]}`)
+	write("clash/datapackage.json", `{"title":"nice clash","keywords":["c"]}`) // title collides with "Nice Clash"
+	e.scanner.Scan(context.Background())
+
+	type item struct {
+		CollectionID int64    `json:"collectionId"`
+		Path         string   `json:"path"`
+		Title        string   `json:"title"`
+		RenameError  string   `json:"renameError"`
+		AddTags      []string `json:"addTags"`
+		SourceURL    string   `json:"sourceUrl"`
+		Orient       []struct {
+			Path string `json:"path"`
+			Up   string `json:"up"`
+		} `json:"orient"`
+	}
+	var preview []item
+	e.mustDo("GET", "/api/import/manyfold", "", &preview)
+	byPath := map[string]item{}
+	for _, it := range preview {
+		byPath[it.Path] = it
+	}
+	if len(preview) != 3 {
+		t.Errorf("preview has %d folders %v, want tank, slashy, clash (broken is skipped, done has nothing new)", len(preview), slices.Collect(maps.Keys(byPath)))
+	}
+	tank := byPath["tank"]
+	if len(tank.Orient) != 1 || tank.Orient[0].Path != "tank/t.stl" || tank.Orient[0].Up != "+y" {
+		t.Errorf("tank orient = %+v, want just t.stl → +y", tank.Orient)
+	}
+	if tank.Title != "Nice Title" || !slices.Equal(tank.AddTags, []string{"tank", "Military"}) ||
+		tank.SourceURL != "https://www.printables.com/model/1" || tank.RenameError != "" {
+		t.Errorf("tank = %+v", tank)
+	}
+	if byPath["slashy"].RenameError == "" || byPath["clash"].RenameError == "" {
+		t.Errorf("unusable titles not flagged: slashy %+v, clash %+v", byPath["slashy"], byPath["clash"])
+	}
+
+	var results []struct {
+		Path  string `json:"path"`
+		Error string `json:"error"`
+	}
+	body, _ := json.Marshal(map[string]any{"folders": []map[string]any{
+		{"collectionId": tank.CollectionID, "rename": true},
+		{"collectionId": byPath["slashy"].CollectionID, "rename": true},
+	}})
+	e.mustDo("POST", "/api/import/manyfold", string(body), &results)
+	if results[0].Error != "" || results[1].Error == "" {
+		t.Errorf("results = %+v, want tank ok and slashy's rename refused", results)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Nice Title", "t.stl")); err != nil {
+		t.Error("tank wasn't renamed to its title")
+	}
+	cols, _ := e.ids()
+	var c collectionResp
+	e.mustDo("GET", "/api/collections/"+itoa(cols["Nice Title"]), "", &c)
+	if !slices.Equal(c.Collection.Tags, []string{"Military", "tank"}) || c.Collection.SourceURL != "https://www.printables.com/model/1" {
+		t.Errorf("imported folder = %+v", c.Collection)
+	}
+	e.mustDo("GET", "/api/collections/"+itoa(cols["slashy"]), "", &c)
+	if !slices.Equal(c.Collection.Tags, []string{"music"}) {
+		t.Errorf("slashy tags = %v; tags should apply even when the rename fails", c.Collection.Tags)
+	}
+
+	var tm struct {
+		Up string `json:"up"`
+	}
+	e.mustDo("GET", "/api/models?collection="+itoa(cols["Nice Title"]), "", &struct{}{})
+	id, _ := e.db.ModelIDByPath(context.Background(), "Nice Title/t.stl")
+	e.mustDo("GET", "/api/models/"+itoa(id), "", &tm)
+	if tm.Up != "+y" {
+		t.Errorf("imported up = %q, want +y", tm.Up)
+	}
+	if res, _ := e.scanner.Scan(context.Background()); res.Added+res.Updated+res.Removed != 0 {
+		t.Errorf("rescan after import = %+v", res)
+	}
+	e.mustDo("GET", "/api/import/manyfold", "", &preview)
+	for _, it := range preview {
+		if it.Path == "Nice Title" {
+			t.Error("imported folder still pending")
+		}
+	}
+}
+
+func TestModelUp(t *testing.T) {
+	e := newEnv(t, "A/x.stl", "A/notes.txt")
+	root := e.scanner.Root
+	// Same bytes, different orientations: separate thumbnails.
+	data, _ := os.ReadFile(filepath.Join(root, "A", "x.stl"))
+	os.WriteFile(filepath.Join(root, "A", "y.stl"), data, 0o644)
+	e.scanner.Scan(context.Background())
+	x, _ := e.db.ModelIDByPath(context.Background(), "A/x.stl")
+	y, _ := e.db.ModelIDByPath(context.Background(), "A/y.stl")
+	notes, _ := e.db.ModelIDByPath(context.Background(), "A/notes.txt")
+
+	var m struct {
+		Up         string `json:"up"`
+		ThumbState string `json:"thumbState"`
+		Copies     int    `json:"copies"`
+	}
+	e.mustDo("PATCH", "/api/models/"+itoa(x), `{"up":"+y"}`, &m)
+	if m.Up != "+y" || m.ThumbState != "pending" || m.Copies != 2 {
+		t.Errorf("after PATCH up: %+v, want +y, pending, still 2 copies", m)
+	}
+	mx, _ := e.db.GetModel(context.Background(), x)
+	my, _ := e.db.GetModel(context.Background(), y)
+	if mx.ThumbKey == my.ThumbKey || mx.Hash != my.Hash {
+		t.Errorf("thumb keys %q / %q should differ for the same hash", mx.ThumbKey, my.ThumbKey)
+	}
+	keys, _ := e.db.AllThumbKeys(context.Background())
+	if !keys[mx.ThumbKey] || !keys[my.ThumbKey] {
+		t.Error("sweep would delete one of the orientations' thumbnails")
+	}
+	for _, tc := range []struct {
+		id   int64
+		body string
+		want int
+	}{
+		{x, `{"up":"y"}`, http.StatusBadRequest},
+		{x, `{"up":"+w"}`, http.StatusBadRequest},
+		{notes, `{"up":"+y"}`, http.StatusNotFound},
+	} {
+		if code := e.do("PATCH", "/api/models/"+itoa(tc.id), tc.body, nil); code != tc.want {
+			t.Errorf("PATCH %s: status %d, want %d", tc.body, code, tc.want)
+		}
+	}
+	// Moving the file keeps its orientation.
+	os.MkdirAll(filepath.Join(root, "B"), 0o755)
+	os.Rename(filepath.Join(root, "A", "x.stl"), filepath.Join(root, "B", "x.stl"))
+	e.scanner.Scan(context.Background())
+	mx, _ = e.db.GetModel(context.Background(), x)
+	if mx.Path != "B/x.stl" || mx.Up != "+y" {
+		t.Errorf("after external move: %s up %q", mx.Path, mx.Up)
+	}
+}
+
+func TestThumbnailVersion(t *testing.T) {
+	e := newEnv(t, "A/x.stl")
+	ctx := context.Background()
+	id, _ := e.db.ModelIDByPath(ctx, "A/x.stl")
+	m, _ := e.db.GetModel(ctx, id)
+	e.db.SetThumbState(ctx, m.ThumbKey, db.ThumbOK, "")
+
+	dir := t.TempDir()
+	old := filepath.Join(dir, m.ThumbKey+".png")
+	os.WriteFile(old, []byte("rendered by an older version"), 0o644)
+	g := thumbnail.NewGenerator(e.db, e.scanner.Root, dir, 1)
+	if err := g.EnsureVersion(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old); err == nil {
+		t.Error("old thumbnail kept")
+	}
+	if m, _ = e.db.GetModel(ctx, id); m.ThumbState != db.ThumbPending {
+		t.Errorf("thumb state = %s, want pending", m.ThumbState)
+	}
+	// Once current, nothing is wiped again.
+	os.WriteFile(old, []byte("new"), 0o644)
+	g.EnsureVersion(ctx)
+	if _, err := os.Stat(old); err != nil {
+		t.Error("current thumbnail wiped on a second start")
+	}
+	var mj struct{ Thumbnail string }
+	e.db.SetThumbState(ctx, m.ThumbKey, db.ThumbOK, "")
+	e.mustDo("GET", "/api/models/"+itoa(id), "", &mj)
+	if !strings.HasSuffix(mj.Thumbnail, fmt.Sprintf("?v=%d", thumbnail.Version)) {
+		t.Errorf("thumbnail URL %q lacks the renderer version", mj.Thumbnail)
+	}
+}
+
+// twoPlate3MF writes a Bambu-style project: plate 1 holds a two-color object
+// (2 triangles), plate 3 an uncolored one (1 triangle). Plate numbers needn't
+// be contiguous.
+func twoPlate3MF(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	add := func(name, body string) {
+		w, _ := zw.Create(name)
+		w.Write([]byte(body))
+	}
+	const ns = `xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06"`
+	const verts = `<vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/><vertex x="0" y="0" z="1"/></vertices>`
+	add("_rels/.rels", `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="r0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>`)
+	add("3D/3dmodel.model", `<model `+ns+`><resources>
+<object id="1"><mesh>`+verts+`<triangles><triangle v1="0" v2="1" v3="2"/><triangle v1="0" v2="1" v3="3" paint_color="8"/></triangles></mesh></object>
+<object id="2"><mesh>`+verts+`<triangles><triangle v1="0" v2="2" v3="3"/></triangles></mesh></object>
+</resources><build><item objectid="1"/><item objectid="2"/></build></model>`)
+	add("Metadata/model_settings.config", `<config>
+<object id="1"><metadata key="extruder" value="1"/></object>
+<object id="2"><metadata key="extruder" value="1"/></object>
+<plate><metadata key="plater_id" value="1"/><model_instance><metadata key="object_id" value="1"/></model_instance></plate>
+<plate><metadata key="plater_id" value="3"/><model_instance><metadata key="object_id" value="2"/></model_instance></plate>
+</config>`)
+	add("Metadata/project_settings.config", `{"filament_colour": ["#FFFFFF", "#000000"]}`)
+	zw.Close()
+	f.Close()
+}
+
+func TestModelPLY(t *testing.T) {
+	e := newEnv(t, "A/plain.stl")
+	twoPlate3MF(t, filepath.Join(e.scanner.Root, "A", "project.3mf"))
+	e.scanner.Scan(context.Background())
+	proj, _ := e.db.ModelIDByPath(context.Background(), "A/project.3mf")
+
+	get := func(path string, header ...string) (*http.Response, string) {
+		t.Helper()
+		req, _ := http.NewRequest("GET", e.srv.URL+path, nil)
+		for i := 0; i+1 < len(header); i += 2 {
+			req.Header.Set(header[i], header[i+1])
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		h, _, _ := strings.Cut(string(body), "end_header\n")
+		return res, h
+	}
+	url := "/api/models/" + itoa(proj) + "/mesh.ply"
+
+	res, h := get(url)
+	if res.StatusCode != 200 || res.Header.Get("X-Plates") != "1,3" || res.Header.Get("X-Plate") != "1" {
+		t.Fatalf("default: %d plates %q plate %q", res.StatusCode, res.Header.Get("X-Plates"), res.Header.Get("X-Plate"))
+	}
+	if !strings.Contains(h, "element face 2\n") || !strings.Contains(h, "property uchar red") {
+		t.Errorf("plate 1 should be 2 colored faces:\n%s", h)
+	}
+	etag := res.Header.Get("ETag")
+	if res, _ := get(url, "If-None-Match", etag); res.StatusCode != http.StatusNotModified {
+		t.Errorf("revalidation: status %d, want 304", res.StatusCode)
+	}
+
+	res, h = get(url + "?plate=3")
+	if res.Header.Get("X-Plate") != "3" || !strings.Contains(h, "element face 1\n") || strings.Contains(h, "red") {
+		t.Errorf("plate 3 should be 1 uncolored face (plate %q):\n%s", res.Header.Get("X-Plate"), h)
+	}
+	if res.Header.Get("ETag") == etag {
+		t.Error("plates share an ETag")
+	}
+	if _, h = get(url + "?plate=0"); !strings.Contains(h, "element face 3\n") {
+		t.Errorf("all plates:\n%s", h)
+	}
+	for _, bad := range []string{"?plate=2", "?plate=x"} {
+		if res, _ := get(url + bad); res.StatusCode != http.StatusNotFound && res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 404/400", bad, res.StatusCode)
+		}
+	}
+
+	stl, _ := e.db.ModelIDByPath(context.Background(), "A/plain.stl")
+	os.WriteFile(filepath.Join(e.scanner.Root, "A", "plain.stl"), []byte("solid x\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid x\n"), 0o644)
+	res, h = get("/api/models/" + itoa(stl) + "/mesh.ply")
+	if res.StatusCode != 200 || res.Header.Get("X-Plates") != "" || strings.Contains(h, "red") {
+		t.Errorf("STL: status %d plates %q header:\n%s", res.StatusCode, res.Header.Get("X-Plates"), h)
 	}
 }

@@ -2,8 +2,27 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
-import { ThreeMFLoader } from 'three/addons/loaders/3MFLoader.js';
-import type { Format } from './api';
+import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+import type { Format, Up } from './api';
+
+/**
+ * Rotations that turn a model's up axis to +Z, the print-file convention.
+ * Row-major. Must match mesh.UpMatrix on the server.
+ */
+const UP_MATRICES: Record<Up, number[]> = {
+  '': [1, 0, 0, 0, 1, 0, 0, 0, 1],
+  '+z': [1, 0, 0, 0, 1, 0, 0, 0, 1],
+  '-z': [1, 0, 0, 0, -1, 0, 0, 0, -1],
+  '+y': [1, 0, 0, 0, 0, -1, 0, 1, 0],
+  '-y': [1, 0, 0, 0, 0, 1, 0, -1, 0],
+  '+x': [0, 0, -1, 0, 1, 0, 1, 0, 0],
+  '-x': [0, 0, 1, 0, 1, 0, -1, 0, 0],
+};
+
+function upMatrix(up: Up) {
+  const [a, b, c, d, e, f, g, h, i] = UP_MATRICES[up] ?? UP_MATRICES[''];
+  return new THREE.Matrix4().set(a, b, c, 0, d, e, f, 0, g, h, i, 0, 0, 0, 0, 1);
+}
 
 const MODEL_COLOR = 0xe8a33d;
 const BACKGROUND = 0x1e2127;
@@ -50,8 +69,10 @@ export class Viewer {
   }
 
   /** Loads a model from raw file bytes. Returns false if it contained no geometry. */
-  load(data: ArrayBuffer, format: Format): boolean {
+  /** Loads a model from file bytes, or 'ply' for the server's mesh. */
+  load(data: ArrayBuffer, format: Format | 'ply', up: Up = ''): boolean {
     const object = parse(data, format);
+    object.applyMatrix4(upMatrix(up));
     if (countTriangles(object) === 0) return false;
     this.setObject(object);
     return true;
@@ -122,7 +143,7 @@ function defaultMaterial() {
   return new THREE.MeshStandardMaterial({ color: MODEL_COLOR, roughness: 0.6, metalness: 0.05 });
 }
 
-function parse(data: ArrayBuffer, format: Format): THREE.Object3D {
+function parse(data: ArrayBuffer, format: Format | 'ply'): THREE.Object3D {
   switch (format) {
     case 'stl':
       return new THREE.Mesh(new STLLoader().parse(data), defaultMaterial());
@@ -133,16 +154,17 @@ function parse(data: ArrayBuffer, format: Format): THREE.Object3D {
       });
       return group;
     }
-    case '3mf': {
-      // Keep colors/textures the file defines; replace the loader's plain white fallback.
-      const group = new ThreeMFLoader().parse(data);
-      group.traverse((child) => {
-        if (child instanceof THREE.Mesh && child.material.name === THREE.Loader.DEFAULT_MATERIAL_NAME) {
-          child.material.dispose();
-          child.material = defaultMaterial();
-        }
-      });
-      return group;
+    case 'ply': {
+      // The server's mesh (used for 3MFs): colored like the thumbnail when the
+      // file has colors. Vertex colors multiply the material color, so that
+      // must be white. Shared vertices would smooth the shading across hard
+      // edges, so shade each facet flat, as STLs look.
+      const geometry = new PLYLoader().parse(data);
+      const material = geometry.hasAttribute('color')
+        ? new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.6, metalness: 0.05 })
+        : defaultMaterial();
+      material.flatShading = true;
+      return new THREE.Mesh(geometry, material);
     }
     default:
       throw new Error(`can't display .${format} files in 3D`);

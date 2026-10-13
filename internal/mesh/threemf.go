@@ -30,27 +30,43 @@ type xmlRelationships struct {
 	} `xml:"Relationship"`
 }
 
+// Untagged namespaces match any namespace, so the materials extension's
+// m:colorgroup and PrusaSlicer's slic3rpe:mmu_segmentation decode without
+// spelling out their URLs.
 type xmlModel struct {
-	Objects []xmlObject `xml:"resources>object"`
-	Items   []struct {
-		ObjectID  int    `xml:"objectid,attr"`
-		Transform string `xml:"transform,attr"`
-		Path      string `xml:"http://schemas.microsoft.com/3dmanufacturing/production/2015/06 path,attr"`
-	} `xml:"build>item"`
+	Objects       []xmlObject `xml:"resources>object"`
+	BaseMaterials []struct {
+		ID    int `xml:"id,attr"`
+		Bases []struct {
+			Color string `xml:"displaycolor,attr"`
+		} `xml:"base"`
+	} `xml:"resources>basematerials"`
+	ColorGroups []struct {
+		ID     int `xml:"id,attr"`
+		Colors []struct {
+			Color string `xml:"color,attr"`
+		} `xml:"color"`
+	} `xml:"resources>colorgroup"`
+	Items []xmlItem `xml:"build>item"`
+}
+
+type xmlItem struct {
+	ObjectID  int    `xml:"objectid,attr"`
+	Transform string `xml:"transform,attr"`
+	Path      string `xml:"http://schemas.microsoft.com/3dmanufacturing/production/2015/06 path,attr"`
 }
 
 type xmlObject struct {
-	ID       int `xml:"id,attr"`
+	ID int `xml:"id,attr"`
+	// Default material: a basematerials or colorgroup id, and an index into it.
+	PID      string `xml:"pid,attr"`
+	PIndex   string `xml:"pindex,attr"`
 	Vertices []struct {
 		X float64 `xml:"x,attr"`
 		Y float64 `xml:"y,attr"`
 		Z float64 `xml:"z,attr"`
 	} `xml:"mesh>vertices>vertex"`
-	Triangles []struct {
-		V1 int `xml:"v1,attr"`
-		V2 int `xml:"v2,attr"`
-		V3 int `xml:"v3,attr"`
-	} `xml:"mesh>triangles>triangle"`
+	Triangles  []xmlTriangle `xml:"mesh>triangles>triangle"`
 	Components []struct {
 		ObjectID  int    `xml:"objectid,attr"`
 		Transform string `xml:"transform,attr"`
@@ -58,23 +74,67 @@ type xmlObject struct {
 	} `xml:"components>component"`
 }
 
+type xmlTriangle struct {
+	V1 int `xml:"v1,attr"`
+	V2 int `xml:"v2,attr"`
+	V3 int `xml:"v3,attr"`
+	// Material per vertex (p1..p3) from a resource (pid); p2/p3 default to p1.
+	PID string `xml:"pid,attr"`
+	P1  string `xml:"p1,attr"`
+	P2  string `xml:"p2,attr"`
+	P3  string `xml:"p3,attr"`
+	// Multi-material painting: Bambu Studio/Orca and PrusaSlicer.
+	PaintColor string `xml:"paint_color,attr"`
+	MMU        string `xml:"mmu_segmentation,attr"`
+}
+
+// modelPart is a parsed .model file: its objects and color resources.
+type modelPart struct {
+	objects map[int]*xmlObject
+	colors  map[int][]fauxgl.Color // basematerials and colorgroups by id
+}
+
 // threeMF lazily parses the model parts of a 3MF package. Geometry may be
 // split across parts via the production extension's p:path (Bambu Studio and
 // Orca do this), so parts are loaded on demand and cached.
 type threeMF struct {
 	zr    *zip.ReadCloser
-	parts map[string]map[int]*xmlObject
+	parts map[string]*modelPart
+	slots *slicerColors // nil unless the file came from a multi-material slicer
 }
 
 // Load3MF reads every build item of a 3MF file into a single mesh, with
-// component and item transforms applied.
-func Load3MF(filename string) (*fauxgl.Mesh, error) {
+// component and item transforms applied. When the file assigns two or more
+// colors (3MF materials, or a slicer's filament assignments and painting),
+// every vertex carries its color and the mesh is reported as colored;
+// otherwise vertex colors are left unset.
+//
+// For multi-plate slicer projects, plate selects which plate to load: a plate
+// number, PlateFirst, or AllPlates. The returned Loaded lists the plates.
+func Load3MF(filename string, plate int) (Loaded, error) {
 	zr, err := zip.OpenReader(filename)
 	if err != nil {
-		return nil, err
+		return Loaded{}, err
 	}
 	defer zr.Close()
-	pkg := &threeMF{zr: zr, parts: map[string]map[int]*xmlObject{}}
+	pkg := &threeMF{zr: zr, parts: map[string]*modelPart{}}
+	pkg.slots = readSlicerColors(zr)
+	plates := pkg.slots.plateNumbers()
+	var onPlate map[int]bool // nil: every item
+	if len(plates) > 0 {
+		switch plate {
+		case AllPlates:
+		case PlateFirst:
+			plate = plates[0]
+			onPlate = pkg.slots.plates[plate]
+		default:
+			if onPlate = pkg.slots.plates[plate]; onPlate == nil {
+				return Loaded{}, ErrNoPlate
+			}
+		}
+	} else if plate > 0 {
+		return Loaded{}, ErrNoPlate
+	}
 
 	root := "3D/3dmodel.model"
 	if rels, err := pkg.rels(); err == nil {
@@ -85,93 +145,136 @@ func Load3MF(filename string) (*fauxgl.Mesh, error) {
 			}
 		}
 	}
-
-	f, err := pkg.zr.Open(root)
+	model, err := pkg.decode(root)
 	if err != nil {
-		return nil, err
+		return Loaded{}, err
 	}
-	var model xmlModel
-	err = xml.NewDecoder(f).Decode(&model)
-	f.Close()
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", root, err)
-	}
-	pkg.parts[root] = indexObjects(model.Objects)
 
-	var tris []*fauxgl.Triangle
-	for _, item := range model.Items {
+	b := &meshBuilder{}
+	for _, item := range model.items {
 		t, err := parseTransform(item.Transform)
 		if err != nil {
-			return nil, err
+			return Loaded{}, err
 		}
 		part := root
 		if item.Path != "" {
 			part = partName(item.Path)
 		}
-		if tris, err = pkg.appendObject(tris, part, item.ObjectID, t, 0); err != nil {
-			return nil, err
+		if onPlate != nil && !onPlate[item.ObjectID] {
+			continue
+		}
+		slot := slotRef{object: item.ObjectID}
+		if err := pkg.appendObject(b, part, item.ObjectID, t, slot, 0); err != nil {
+			return Loaded{}, err
 		}
 	}
-	return fauxgl.NewTriangleMesh(tris), nil
+	m, colored := b.mesh(pkg.slots.multiColor())
+	return Loaded{Mesh: m, Colored: colored, Plates: plates, Plate: max(plate, 0)}, nil
 }
 
-func (p *threeMF) appendObject(tris []*fauxgl.Triangle, part string, id int, m fauxgl.Matrix, depth int) ([]*fauxgl.Triangle, error) {
+// slotRef identifies where a slicer's filament assignment for some geometry
+// lives: the build item's object, and the part (component) within it.
+type slotRef struct {
+	object, part int
+	hasPart      bool
+}
+
+func (p *threeMF) appendObject(b *meshBuilder, part string, id int, m fauxgl.Matrix, slot slotRef, depth int) error {
 	if depth > maxComponentDepth {
-		return nil, fmt.Errorf("components nested deeper than %d", maxComponentDepth)
+		return fmt.Errorf("components nested deeper than %d", maxComponentDepth)
 	}
-	objects, err := p.part(part)
+	mp, err := p.part(part)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	obj := objects[id]
+	obj := mp.objects[id]
 	if obj == nil {
-		return nil, fmt.Errorf("%s: object %d not found", part, id)
+		return fmt.Errorf("%s: object %d not found", part, id)
 	}
 
 	n := len(obj.Vertices)
-	for _, t := range obj.Triangles {
+	for i, t := range obj.Triangles {
 		if t.V1 < 0 || t.V2 < 0 || t.V3 < 0 || t.V1 >= n || t.V2 >= n || t.V3 >= n {
-			return nil, fmt.Errorf("%s: object %d: triangle index out of range", part, id)
+			return fmt.Errorf("%s: object %d: triangle index out of range", part, id)
 		}
 		v := func(i int) fauxgl.Vector {
 			return m.MulPosition(fauxgl.V(obj.Vertices[i].X, obj.Vertices[i].Y, obj.Vertices[i].Z))
 		}
-		tris = append(tris, fauxgl.NewTriangleForPoints(v(t.V1), v(t.V2), v(t.V3)))
+		if !p.slots.trianglePrintable(slot, i) {
+			continue
+		}
+		tri := fauxgl.NewTriangleForPoints(v(t.V1), v(t.V2), v(t.V3))
+		colors, ok := p.triangleColors(mp, obj, t, i, slot)
+		b.add(tri, colors, ok)
 	}
 
 	for _, c := range obj.Components {
 		ct, err := parseTransform(c.Transform)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		cpart := part
 		if c.Path != "" {
 			cpart = partName(c.Path)
 		}
+		cslot := slot
+		if depth == 0 {
+			cslot.part, cslot.hasPart = c.ObjectID, true
+		}
+		// Slicer modifiers, negative volumes and support blockers are
+		// components too, but aren't part of the printed shape.
+		if !p.slots.printable(cslot) {
+			continue
+		}
 		// The component's transform applies first, then its parent's.
-		if tris, err = p.appendObject(tris, cpart, c.ObjectID, m.Mul(ct), depth+1); err != nil {
-			return nil, err
+		if err := p.appendObject(b, cpart, c.ObjectID, m.Mul(ct), cslot, depth+1); err != nil {
+			return err
 		}
 	}
-	return tris, nil
+	return nil
 }
 
-func (p *threeMF) part(name string) (map[int]*xmlObject, error) {
-	if objs, ok := p.parts[name]; ok {
-		return objs, nil
-	}
+// decodedModel is what a .model file contributes beyond its objects.
+type decodedModel struct {
+	items []xmlItem
+}
+
+func (p *threeMF) decode(name string) (decodedModel, error) {
 	f, err := p.zr.Open(name)
 	if err != nil {
-		return nil, err
+		return decodedModel{}, err
 	}
 	defer f.Close()
 	var model xmlModel
 	if err := xml.NewDecoder(f).Decode(&model); err != nil {
-		return nil, fmt.Errorf("%s: %w", name, err)
+		return decodedModel{}, fmt.Errorf("%s: %w", name, err)
 	}
-	objs := indexObjects(model.Objects)
-	p.parts[name] = objs
-	return objs, nil
+	mp := &modelPart{objects: map[int]*xmlObject{}, colors: map[int][]fauxgl.Color{}}
+	for i := range model.Objects {
+		mp.objects[model.Objects[i].ID] = &model.Objects[i]
+	}
+	for _, bm := range model.BaseMaterials {
+		for _, base := range bm.Bases {
+			mp.colors[bm.ID] = append(mp.colors[bm.ID], parseColor(base.Color))
+		}
+	}
+	for _, cg := range model.ColorGroups {
+		for _, c := range cg.Colors {
+			mp.colors[cg.ID] = append(mp.colors[cg.ID], parseColor(c.Color))
+		}
+	}
+	p.parts[name] = mp
+	return decodedModel{items: model.Items}, nil
+}
+
+func (p *threeMF) part(name string) (*modelPart, error) {
+	if mp, ok := p.parts[name]; ok {
+		return mp, nil
+	}
+	if _, err := p.decode(name); err != nil {
+		return nil, err
+	}
+	return p.parts[name], nil
 }
 
 func (p *threeMF) rels() (*xmlRelationships, error) {
@@ -185,14 +288,6 @@ func (p *threeMF) rels() (*xmlRelationships, error) {
 		return nil, err
 	}
 	return &rels, nil
-}
-
-func indexObjects(objs []xmlObject) map[int]*xmlObject {
-	m := make(map[int]*xmlObject, len(objs))
-	for i := range objs {
-		m[objs[i].ID] = &objs[i]
-	}
-	return m
 }
 
 // partName converts an OPC part reference ("/3D/3dmodel.model") to a zip entry name.

@@ -24,7 +24,11 @@ export interface Model {
   downloadCount: number;
   /** Unix seconds; null if never downloaded. */
   lastDownloadedAt: number | null;
+  /** Which axis of the file points up; "" means unknown (treated as +z). */
+  up: Up;
 }
+
+export type Up = '' | '+z' | '-z' | '+y' | '-y' | '+x' | '-x';
 
 export interface DuplicateGroup {
   hash: string;
@@ -88,6 +92,8 @@ export interface Patch {
   tags?: string[];
   /** http(s) link; "" clears it. A missing scheme is assumed to be https. */
   sourceUrl?: string;
+  /** Models only: which axis points up; "" resets. */
+  up?: Up;
 }
 
 export interface ScanResult {
@@ -245,6 +251,41 @@ export async function purgeTrash(id?: string) {
   if (!res.ok) throw new ApiError(res.status, (await res.text()).trim(), 'DELETE', '/api/trash');
 }
 
+/** Adds and removes direct tags on many items at once. */
+export async function bulkTags(sel: { models: number[]; collections: number[] }, add: string[], remove: string[]) {
+  await fetch('/api/tags/bulk', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...sel, add, remove }),
+  }).then(async (res) => {
+    if (!res.ok) throw new ApiError(res.status, (await res.text()).trim(), 'POST', '/api/tags/bulk');
+  });
+}
+
+/** What importing one folder's Manyfold datapackage.json would do. */
+export interface ManyfoldImport {
+  collectionId: number;
+  path: string;
+  name: string;
+  /** Manyfold's display name, offered as a rename. */
+  title: string;
+  /** Why the title can't be used as a folder name, if it can't. */
+  renameError?: string;
+  addTags: string[];
+  sourceUrl?: string;
+  /** Models whose up axis Manyfold records differently. */
+  orient: { modelId: number; path: string; up: Up }[];
+}
+
+export const manyfoldPreview = () => request<ManyfoldImport[]>('/api/import/manyfold');
+
+export const manyfoldApply = (folders: { collectionId: number; rename: boolean }[]) =>
+  request<{ collectionId: number; path: string; error?: string }[]>('/api/import/manyfold', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folders }),
+  });
+
 export const patchCollection = (id: number, body: Patch) => patch<Collection>(`/api/collections/${id}`, body);
 
 export const rescan = () => request<ScanResult>('/api/rescan', { method: 'POST' });
@@ -256,4 +297,9 @@ export const isImage = (m: Model) => m.kind === 'file' && imageFormats.has(m.for
 
 export const fileURL = (id: number) => `/api/models/${id}/file`;
 
-export const meshURL = (id: number) => `/api/models/${id}/mesh.stl`;
+/**
+ * The model's mesh for the 3D viewer, colored like its thumbnail. For
+ * multi-plate projects, plate picks one (default: the first; 0: all).
+ */
+export const meshURL = (id: number, plate?: number) =>
+  `/api/models/${id}/mesh.ply${plate === undefined ? '' : `?plate=${plate}`}`;

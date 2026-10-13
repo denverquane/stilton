@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -37,6 +39,9 @@ type Server struct {
 	Scanner *library.Scanner
 	Thumbs  *thumbnail.Generator
 	Web     fs.FS // built frontend; nil or missing index.html serves a placeholder
+	// AllowedHosts are extra host names the server may be reached by, beyond
+	// IP addresses, localhost, and this machine's hostname. See guard.
+	AllowedHosts []string
 }
 
 // meshSlots bounds concurrent mesh merges; a multi-million-triangle model can
@@ -52,12 +57,16 @@ type modelJSON struct {
 func toJSON(m db.Model) modelJSON {
 	out := modelJSON{Model: m}
 	if m.ThumbState == db.ThumbOK {
-		out.Thumbnail = thumbURL(m.Hash)
+		out.Thumbnail = thumbURL(m.ThumbKey)
 	}
 	return out
 }
 
-func thumbURL(hash string) string { return "/thumbs/" + hash + ".png" }
+// thumbURL is a thumbnail's URL. The renderer version busts browser caches
+// (thumbnails are served as immutable) when rendering changes.
+func thumbURL(key string) string {
+	return "/thumbs/" + key + ".png?v=" + strconv.Itoa(thumbnail.Version)
+}
 
 // collectionPreviews is how many thumbnails a folder card shows.
 const collectionPreviews = 4
@@ -73,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/models/{id}", s.getModel)
 	mux.HandleFunc("GET /api/models/{id}/file", s.modelFile)
 	mux.HandleFunc("GET /api/models/{id}/mesh.stl", s.modelMesh)
+	mux.HandleFunc("GET /api/models/{id}/mesh.ply", s.modelPLY)
 	mux.HandleFunc("PATCH /api/models/{id}", s.patchModel)
 	mux.HandleFunc("POST /api/collections", s.createCollection)
 	mux.HandleFunc("GET /api/collections/{id}", s.getCollection)
@@ -89,10 +99,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/duplicates", s.listDuplicates)
 	mux.HandleFunc("POST /api/duplicates/{hash}/resolve", s.resolveDuplicates)
 	mux.HandleFunc("GET /api/tags", s.listTags)
+	mux.HandleFunc("POST /api/tags/bulk", s.bulkTags)
+	mux.HandleFunc("GET /api/import/manyfold", s.manyfoldPreview)
+	mux.HandleFunc("POST /api/import/manyfold", s.manyfoldApply)
 	mux.HandleFunc("POST /api/rescan", s.rescan)
 	mux.HandleFunc("GET /thumbs/{file}", s.thumb)
 	mux.Handle("/", s.webHandler())
-	return mux
+	return guard(mux, s.AllowedHosts)
 }
 
 // listModels lists models in a collection. What's included depends on the
@@ -203,7 +216,7 @@ func (s *Server) getCollection(w http.ResponseWriter, r *http.Request) {
 	out := make([]collectionChildJSON, len(children))
 	for i, c := range children {
 		out[i] = collectionChildJSON{CollectionSummary: c, Previews: []string{}}
-		for _, h := range c.PreviewHashes {
+		for _, h := range c.PreviewKeys {
 			out[i].Previews = append(out[i].Previews, thumbURL(h))
 		}
 	}
@@ -282,7 +295,9 @@ func writeMoveResult(w http.ResponseWriter, c db.Collection, err error, okStatus
 // patchBody is a partial update; absent fields are left unchanged.
 type patchBody struct {
 	// Name renames the file (keeping its extension) or folder on disk.
-	Name      *string   `json:"name"`
+	Name *string `json:"name"`
+	// Up sets which axis of a 3D model points up: "+z", "-y", ...; "" resets.
+	Up        *string   `json:"up"`
 	Tags      *[]string `json:"tags"`
 	SourceURL *string   `json:"sourceUrl"`
 }
@@ -298,6 +313,10 @@ func decodePatch(w http.ResponseWriter, r *http.Request) (patchBody, bool) {
 	if body.Tags != nil {
 		tags := normalizeTags(*body.Tags)
 		body.Tags = &tags
+	}
+	if body.Up != nil && !db.ValidUp(*body.Up) {
+		http.Error(w, `up must be one of +x, -x, +y, -y, +z, -z (or "" to reset)`, http.StatusBadRequest)
+		return body, false
 	}
 	if body.SourceURL != nil {
 		u, err := normalizeSourceURL(*body.SourceURL)
@@ -330,6 +349,11 @@ func (s *Server) patchModel(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil && body.SourceURL != nil {
 		err = s.DB.SetModelSourceURL(r.Context(), id, *body.SourceURL)
+	}
+	if err == nil && body.Up != nil {
+		if err = s.DB.SetModelUp(r.Context(), id, *body.Up); err == nil {
+			s.Thumbs.Wake() // render the new orientation
+		}
 	}
 	if !s.patchError(w, r, err) {
 		s.getModel(w, r)
@@ -456,6 +480,62 @@ func (s *Server) modelMesh(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "no-cache")
 	if err := mesh.WriteBinarySTL(w, mm); err != nil {
+		slog.Warn("write mesh", "path", m.Path, "err", err)
+	}
+}
+
+// modelPLY serves a model's mesh for the 3D viewer, with the same colors as
+// its thumbnail. ?plate= picks a plate of a multi-plate slicer project
+// (default: the first, as in the thumbnail; 0: all). X-Plates lists the
+// plates when there's more than one, and X-Plate says which was sent.
+func (s *Server) modelPLY(w http.ResponseWriter, r *http.Request) {
+	m, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	plate := mesh.PlateFirst
+	if p := r.URL.Query().Get("plate"); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			http.Error(w, "plate must be a plate number, or 0 for all plates", http.StatusBadRequest)
+			return
+		}
+		plate = n
+	}
+	// The plate in the ETag is what was asked for; the first plate's number
+	// isn't known until the file is read.
+	etag := fmt.Sprintf(`"ply-%s-p%d-v%d"`, m.Hash, plate, mesh.PLYVersion)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	select {
+	case meshSlots <- struct{}{}:
+		defer func() { <-meshSlots }()
+	case <-r.Context().Done():
+		return
+	}
+	l, err := mesh.LoadModel(filepath.Join(s.Scanner.Root, filepath.FromSlash(m.Path)), m.Format, plate)
+	if errors.Is(err, mesh.ErrNoPlate) {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ply")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache")
+	if len(l.Plates) > 1 {
+		plates := make([]string, len(l.Plates))
+		for i, n := range l.Plates {
+			plates[i] = strconv.Itoa(n)
+		}
+		w.Header().Set("X-Plates", strings.Join(plates, ","))
+	}
+	w.Header().Set("X-Plate", strconv.Itoa(l.Plate))
+	if err := mesh.WriteBinaryPLY(w, l.Mesh, l.Colored); err != nil {
 		slog.Warn("write mesh", "path", m.Path, "err", err)
 	}
 }
@@ -589,6 +669,59 @@ func (s *Server) resolveDuplicates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, res)
 }
 
+// bulkTags adds and removes tags on many models and collections at once.
+func (s *Server) bulkTags(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Models      []int64  `json:"models"`
+		Collections []int64  `json:"collections"`
+		Add         []string `json:"add"`
+		Remove      []string `json:"remove"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if len(body.Models) == 0 && len(body.Collections) == 0 {
+		http.Error(w, "nothing selected", http.StatusBadRequest)
+		return
+	}
+	if slices.Contains(body.Collections, db.RootCollectionID) {
+		http.Error(w, "the library root can't be tagged", http.StatusBadRequest)
+		return
+	}
+	err := s.DB.BulkTags(r.Context(), body.Models, body.Collections, normalizeTags(body.Add), normalizeTags(body.Remove))
+	if !s.patchError(w, r, err) {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// manyfoldPreview lists folders whose Manyfold datapackage.json would add
+// tags, a source link, or a better folder name.
+func (s *Server) manyfoldPreview(w http.ResponseWriter, r *http.Request) {
+	items, err := s.Scanner.ManyfoldPreview(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, items)
+}
+
+func (s *Server) manyfoldApply(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Folders []library.ManyfoldApplyRequest `json:"folders"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	results, err := s.Scanner.ManyfoldApply(r.Context(), body.Folders)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, results)
+}
+
 func (s *Server) listTags(w http.ResponseWriter, r *http.Request) {
 	tags, err := s.DB.ListTags(r.Context())
 	if err != nil {
@@ -610,14 +743,14 @@ func (s *Server) rescan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) thumb(w http.ResponseWriter, r *http.Request) {
-	hash, ok := strings.CutSuffix(r.PathValue("file"), ".png")
-	if !ok || !isHexHash(hash) {
+	key, ok := strings.CutSuffix(r.PathValue("file"), ".png")
+	if !ok || !thumbnail.IsKey(key) {
 		http.NotFound(w, r)
 		return
 	}
 	// URLs are content-addressed, so the browser may cache them forever.
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	http.ServeFile(w, r, s.Thumbs.Path(hash))
+	http.ServeFile(w, r, s.Thumbs.Path(key))
 }
 
 func (s *Server) webHandler() http.Handler {

@@ -3,9 +3,13 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"embed"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	pathpkg "path"
 	"path/filepath"
 	"slices"
@@ -55,7 +59,28 @@ type Model struct {
 	Tags         []string `json:"tags"`
 	Copies       int      `json:"copies"` // models with identical contents, including this one
 	Kind         string   `json:"kind"`   // KindModel or KindFile
+	Up           string   `json:"up"`     // see ValidUp; "" means unknown (treated as +z)
+	ThumbKey     string   `json:"-"`      // names the thumbnail; see ThumbKey
 	DownloadStats
+}
+
+// ValidUp reports whether up names an axis direction: "+z", "-y", and so on.
+// "" (unknown) is also accepted.
+func ValidUp(up string) bool {
+	return up == "" || len(up) == 2 && (up[0] == '+' || up[0] == '-') && strings.ContainsRune("xyz", rune(up[1]))
+}
+
+// ThumbKey names a model's thumbnail: its hash, plus its orientation when
+// that isn't the default. Must match the thumb_key column in the schema.
+func ThumbKey(hash, up string) string {
+	if up == "" || up == "+z" {
+		return hash
+	}
+	sign := "p"
+	if up[0] == '-' {
+		sign = "n"
+	}
+	return hash + "_" + sign + up[1:]
 }
 
 // DownloadStats summarizes the downloads of a model or collection.
@@ -78,10 +103,10 @@ type Collection struct {
 // CollectionSummary describes a child collection for display as a folder card.
 type CollectionSummary struct {
 	Collection
-	ModelCount    int      `json:"modelCount"`   // models anywhere beneath it
-	FileCount     int      `json:"fileCount"`    // other files anywhere beneath it
-	PendingCount  int      `json:"pendingCount"` // of those, thumbnails not yet rendered
-	PreviewHashes []string `json:"-"`
+	ModelCount   int      `json:"modelCount"`   // models anywhere beneath it
+	FileCount    int      `json:"fileCount"`    // other files anywhere beneath it
+	PendingCount int      `json:"pendingCount"` // of those, thumbnails not yet rendered
+	PreviewKeys  []string `json:"-"`            // thumbnail keys
 }
 
 func Open(dataDir string) (*DB, error) {
@@ -94,117 +119,42 @@ func Open(dataDir string) (*DB, error) {
 	d := &DB{sql: sqlDB}
 	if err := d.migrate(); err != nil {
 		sqlDB.Close()
+		if errors.Is(err, errStaleSchema) {
+			return nil, fmt.Errorf("%s was created by an older version: %w. Delete it (and its -wal/-shm files) and restart; thumbnails are kept", filepath.Join(dataDir, "stilton.db"), err)
+		}
 		return nil, fmt.Errorf("migrate: %w", err)
-	}
-	// The schema is still edited in place rather than migrated, so a database
-	// from an older build looks current but lacks newer columns and tables.
-	if _, err := sqlDB.Exec(`SELECT kind FROM models LIMIT 0; SELECT 1 FROM downloads LIMIT 0`); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("%s was created by an older version and its schema is out of date (%v); delete it (and its -wal/-shm files) and restart. Thumbnails are kept", filepath.Join(dataDir, "stilton.db"), err)
 	}
 	return d, nil
 }
 
 func (d *DB) Close() error { return d.sql.Close() }
 
-// migrations are applied in order; PRAGMA user_version records how many have run.
-// Append new migrations, never edit old ones.
-var migrations = []string{
-	`
-	-- Collections mirror the library's folders. Models reference their folder
-	-- without ON DELETE CASCADE, so pruning a non-empty collection fails loudly
-	-- instead of deleting models (and their tags).
-	CREATE TABLE collections (
-		id        INTEGER PRIMARY KEY,
-		parent_id INTEGER REFERENCES collections(id) ON DELETE CASCADE,
-		path       TEXT NOT NULL UNIQUE,
-		name       TEXT NOT NULL,
-		source_url TEXT NOT NULL DEFAULT ''
-	);
-	CREATE INDEX collections_parent ON collections(parent_id);
-	INSERT INTO collections (id, parent_id, path, name) VALUES (1, NULL, '', 'Library');
-
-	CREATE TABLE models (
-		id            INTEGER PRIMARY KEY,
-		collection_id INTEGER NOT NULL REFERENCES collections(id),
-		kind          TEXT NOT NULL DEFAULT 'model',
-		path          TEXT NOT NULL UNIQUE,
-		name        TEXT NOT NULL,
-		format      TEXT NOT NULL,
-		size        INTEGER NOT NULL,
-		mtime       INTEGER NOT NULL,
-		hash        TEXT NOT NULL,
-		thumb_state TEXT NOT NULL DEFAULT 'pending',
-		thumb_error TEXT NOT NULL DEFAULT '',
-		added_at    INTEGER NOT NULL,
-		source_url  TEXT NOT NULL DEFAULT ''
-	);
-	CREATE INDEX models_hash ON models(hash);
-	CREATE INDEX models_collection ON models(collection_id);
-	CREATE INDEX models_thumb_state ON models(thumb_state);
-	CREATE INDEX models_kind ON models(kind);
-
-	CREATE TABLE tags (
-		id   INTEGER PRIMARY KEY,
-		name TEXT NOT NULL UNIQUE COLLATE NOCASE
-	);
-	CREATE TABLE model_tags (
-		model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-		tag_id   INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-		PRIMARY KEY (model_id, tag_id)
-	);
-	CREATE TABLE collection_tags (
-		collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-		tag_id        INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-		PRIMARY KEY (collection_id, tag_id)
-	);
-
-	-- One row per download of a model file or a folder (as a zip). Ids are
-	-- nulled rather than cascaded when the item leaves the index, so history
-	-- survives; path records what it was called at the time. user_id is for
-	-- when there are accounts: nothing sets it yet, and there's no users table
-	-- to reference.
-	CREATE TABLE downloads (
-		id            INTEGER PRIMARY KEY,
-		kind          TEXT NOT NULL,  -- 'model' (any indexed file) or 'collection'
-		model_id      INTEGER REFERENCES models(id) ON DELETE SET NULL,
-		collection_id INTEGER REFERENCES collections(id) ON DELETE SET NULL,
-		path          TEXT NOT NULL,
-		user_id       INTEGER,
-		remote_addr   TEXT NOT NULL DEFAULT '',
-		downloaded_at INTEGER NOT NULL
-	);
-	CREATE INDEX downloads_model ON downloads(model_id, downloaded_at);
-	CREATE INDEX downloads_collection ON downloads(collection_id, downloaded_at);
-	CREATE INDEX downloads_time ON downloads(downloaded_at);
-
-	CREATE VIRTUAL TABLE models_fts USING fts5(name, path, content='models', content_rowid='id');
-	CREATE TRIGGER models_ai AFTER INSERT ON models BEGIN
-		INSERT INTO models_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
-	END;
-	CREATE TRIGGER models_ad AFTER DELETE ON models BEGIN
-		INSERT INTO models_fts(models_fts, rowid, name, path) VALUES ('delete', old.id, old.name, old.path);
-	END;
-	CREATE TRIGGER models_au AFTER UPDATE OF name, path ON models BEGIN
-		INSERT INTO models_fts(models_fts, rowid, name, path) VALUES ('delete', old.id, old.name, old.path);
-		INSERT INTO models_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
-	END;
-	`,
-}
+// schemaFiles are the schema scripts, applied in name order (so number them
+// 0001_, 0002_, ...). PRAGMA user_version records how many have run.
+//
+//go:embed schema/*.sql
+var schemaFiles embed.FS
 
 func (d *DB) migrate() error {
+	scripts, err := schemaScripts()
+	if err != nil {
+		return err
+	}
 	var version int
 	if err := d.sql.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	for i := version; i < len(migrations); i++ {
+	if version > len(scripts) {
+		return fmt.Errorf("database schema version %d is newer than this build supports (%d)", version, len(scripts))
+	}
+	for i := version; i < len(scripts); i++ {
 		tx, err := d.sql.Begin()
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(migrations[i]); err != nil {
+		if _, err := tx.Exec(scripts[i].sql); err != nil {
 			tx.Rollback()
-			return fmt.Errorf("migration %d: %w", i+1, err)
+			return fmt.Errorf("schema %s: %w", scripts[i].name, err)
 		}
 		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", i+1)); err != nil {
 			tx.Rollback()
@@ -214,15 +164,73 @@ func (d *DB) migrate() error {
 			return err
 		}
 	}
-	return nil
+	return d.checkFingerprint(scripts)
 }
 
-const modelColumns = `id, collection_id, kind, path, name, format, size, mtime, hash, thumb_state, thumb_error, added_at, source_url`
+type schemaScript struct{ name, sql string }
+
+func schemaScripts() ([]schemaScript, error) {
+	entries, err := fs.ReadDir(schemaFiles, "schema")
+	if err != nil {
+		return nil, err
+	}
+	var out []schemaScript
+	for _, e := range entries { // ReadDir sorts by name
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		data, err := fs.ReadFile(schemaFiles, "schema/"+e.Name())
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, schemaScript{e.Name(), string(data)})
+	}
+	return out, nil
+}
+
+// schemaFingerprint identifies the exact schema scripts a database was built
+// from. It's stored in PRAGMA application_id, so a database created before a
+// script was edited in place is detected instead of failing on a missing
+// column later.
+func schemaFingerprint(scripts []schemaScript) int32 {
+	h := sha256.New()
+	for _, s := range scripts {
+		h.Write([]byte(s.name))
+		h.Write([]byte{0})
+		h.Write([]byte(s.sql))
+	}
+	sum := h.Sum(nil)
+	return int32(binary.BigEndian.Uint32(sum[:4]))
+}
+
+func (d *DB) checkFingerprint(scripts []schemaScript) error {
+	want := schemaFingerprint(scripts)
+	var got int32
+	if err := d.sql.QueryRow("PRAGMA application_id").Scan(&got); err != nil {
+		return err
+	}
+	if got == want {
+		return nil
+	}
+	if got == 0 {
+		// Created before fingerprints existed. Adopt it if it has the newest
+		// tables and columns; otherwise it's from an older schema.
+		if _, err := d.sql.Exec(`SELECT kind FROM models LIMIT 0; SELECT 1 FROM downloads LIMIT 0`); err == nil {
+			_, err = d.sql.Exec(fmt.Sprintf("PRAGMA application_id = %d", want))
+			return err
+		}
+	}
+	return errStaleSchema
+}
+
+var errStaleSchema = errors.New("its schema is out of date (the schema files changed since it was created)")
+
+const modelColumns = `id, collection_id, kind, path, name, format, size, mtime, hash, thumb_state, thumb_error, added_at, source_url, up, thumb_key`
 
 func scanModel(row interface{ Scan(...any) error }) (Model, error) {
 	var m Model
 	err := row.Scan(&m.ID, &m.CollectionID, &m.Kind, &m.Path, &m.Name, &m.Format, &m.Size, &m.Mtime, &m.Hash,
-		&m.ThumbState, &m.ThumbError, &m.AddedAt, &m.SourceURL)
+		&m.ThumbState, &m.ThumbError, &m.AddedAt, &m.SourceURL, &m.Up, &m.ThumbKey)
 	return m, err
 }
 
@@ -236,13 +244,16 @@ func scanCollection(row interface{ Scan(...any) error }) (Collection, error) {
 
 // FileInfo is the subset of a model the scanner needs to decide whether a file changed.
 type FileInfo struct {
-	Size  int64
-	Mtime int64
+	ID           int64
+	CollectionID int64
+	Size         int64
+	Mtime        int64
+	Hash         string
 }
 
 // KnownFiles returns size/mtime for every indexed path.
 func (d *DB) KnownFiles(ctx context.Context) (map[string]FileInfo, error) {
-	rows, err := d.sql.QueryContext(ctx, `SELECT path, size, mtime FROM models`)
+	rows, err := d.sql.QueryContext(ctx, `SELECT id, collection_id, path, size, mtime, hash FROM models`)
 	if err != nil {
 		return nil, err
 	}
@@ -251,12 +262,61 @@ func (d *DB) KnownFiles(ctx context.Context) (map[string]FileInfo, error) {
 	for rows.Next() {
 		var p string
 		var fi FileInfo
-		if err := rows.Scan(&p, &fi.Size, &fi.Mtime); err != nil {
+		if err := rows.Scan(&fi.ID, &fi.CollectionID, &p, &fi.Size, &fi.Mtime, &fi.Hash); err != nil {
 			return nil, err
 		}
 		known[p] = fi
 	}
 	return known, rows.Err()
+}
+
+// RelocateModel records that a model's file moved (same contents, new path),
+// keeping its id and so its tags, source link, and download history.
+func (d *DB) RelocateModel(ctx context.Context, id int64, m Model) error {
+	_, err := d.sql.ExecContext(ctx, `
+		UPDATE models SET collection_id = ?, kind = ?, path = ?, name = ?, format = ?, size = ?, mtime = ?
+		WHERE id = ?`, m.CollectionID, m.Kind, m.Path, m.Name, m.Format, m.Size, m.Mtime, id)
+	return err
+}
+
+// CollectionIDs returns the id of every collection, by path.
+func (d *DB) CollectionIDs(ctx context.Context) (map[string]int64, error) {
+	rows, err := d.sql.QueryContext(ctx, `SELECT path, id FROM collections`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var p string
+		var id int64
+		if err := rows.Scan(&p, &id); err != nil {
+			return nil, err
+		}
+		out[p] = id
+	}
+	return out, rows.Err()
+}
+
+// TransferCollection gives toID the tags, source link (if it has none), and
+// download history of fromID, for a folder that was moved or renamed.
+func (d *DB) TransferCollection(ctx context.Context, fromID, toID int64) error {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`INSERT OR IGNORE INTO collection_tags (collection_id, tag_id) SELECT ?, tag_id FROM collection_tags WHERE collection_id = ?`,
+		`UPDATE collections SET source_url = (SELECT source_url FROM collections WHERE id = ?2)
+			WHERE id = ?1 AND source_url = ''`,
+		`UPDATE downloads SET collection_id = ?1 WHERE collection_id = ?2`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, toID, fromID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // UpsertModel inserts a new model or updates a changed one. A content change
@@ -312,11 +372,33 @@ func (d *DB) PendingThumbnails(ctx context.Context, limit int) ([]Model, error) 
 }
 
 // SetThumbState records the thumbnail result for every model with the given
-// hash, since identical files share a thumbnail.
-func (d *DB) SetThumbState(ctx context.Context, hash, state, errMsg string) error {
+// thumbnail key, since identical files in the same orientation share one.
+func (d *DB) SetThumbState(ctx context.Context, key, state, errMsg string) error {
 	_, err := d.sql.ExecContext(ctx,
-		`UPDATE models SET thumb_state = ?, thumb_error = ? WHERE hash = ?`, state, errMsg, hash)
+		`UPDATE models SET thumb_state = ?, thumb_error = ? WHERE thumb_key = ?`, state, errMsg, key)
 	return err
+}
+
+// ResetThumbnails marks every rendered or failed thumbnail as pending, for
+// when the renderer changes.
+func (d *DB) ResetThumbnails(ctx context.Context) error {
+	_, err := d.sql.ExecContext(ctx,
+		`UPDATE models SET thumb_state = 'pending', thumb_error = '' WHERE thumb_state IN ('ok', 'failed')`)
+	return err
+}
+
+// SetModelUp records which axis of a 3D model points up. Its thumbnail is
+// re-rendered for the new orientation.
+func (d *DB) SetModelUp(ctx context.Context, id int64, up string) error {
+	res, err := d.sql.ExecContext(ctx,
+		`UPDATE models SET up = ?, thumb_state = 'pending', thumb_error = '' WHERE id = ? AND kind = 'model'`, up, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 type ListQuery struct {
@@ -697,6 +779,80 @@ func (d *DB) setTags(ctx context.Context, l tagLink, id int64, tags []string) er
 	return tx.Commit()
 }
 
+// BulkTags adds and removes tags on many models and collections at once.
+// Only direct tags are affected; a tag inherited from a folder above can't be
+// removed here. Nothing changes if any id doesn't exist.
+func (d *DB) BulkTags(ctx context.Context, modelIDs, collectionIDs []int64, add, remove []string) error {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, l := range []struct {
+		link tagLink
+		ids  []int64
+	}{{modelTags, modelIDs}, {collectionTags, collectionIDs}} {
+		if len(l.ids) == 0 {
+			continue
+		}
+		placeholders := make([]string, len(l.ids))
+		ids := make([]any, len(l.ids))
+		for i, id := range l.ids {
+			placeholders[i] = "?"
+			ids[i] = id
+		}
+		in := `(` + strings.Join(placeholders, ",") + `)`
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT count(DISTINCT id) FROM `+l.link.ownerTable+` WHERE id IN `+in, ids...).Scan(&n); err != nil {
+			return err
+		}
+		if n != len(slices.Compact(slices.Sorted(slices.Values(l.ids)))) {
+			return ErrNotFound
+		}
+		for _, t := range add {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING`, t); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR IGNORE INTO `+l.link.table+` (`+l.link.ownerCol+`, tag_id)
+				SELECT o.id, t.id FROM `+l.link.ownerTable+` o, tags t WHERE o.id IN `+in+` AND t.name = ?`,
+				append(ids, t)...); err != nil {
+				return err
+			}
+		}
+		for _, t := range remove {
+			if _, err := tx.ExecContext(ctx, `
+				DELETE FROM `+l.link.table+` WHERE `+l.link.ownerCol+` IN `+in+`
+				AND tag_id IN (SELECT id FROM tags WHERE name = ?)`, append(ids, t)...); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, pruneTagsSQL); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// FilesNamed returns indexed non-model files with exactly this file name.
+func (d *DB) FilesNamed(ctx context.Context, name string) ([]Model, error) {
+	rows, err := d.sql.QueryContext(ctx, `
+		SELECT `+modelColumns+` FROM models WHERE kind = 'file' AND name = ? ORDER BY path`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Model
+	for rows.Next() {
+		m, err := scanModel(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 const pruneTagsSQL = `DELETE FROM tags
 	WHERE id NOT IN (SELECT tag_id FROM model_tags) AND id NOT IN (SELECT tag_id FROM collection_tags)`
 
@@ -844,9 +1000,9 @@ func (d *DB) DeleteItems(ctx context.Context, modelIDs []int64, collections []Co
 	return tx.Commit()
 }
 
-// AllHashes returns the content hash of every indexed model.
-func (d *DB) AllHashes(ctx context.Context) (map[string]bool, error) {
-	rows, err := d.sql.QueryContext(ctx, `SELECT DISTINCT hash FROM models`)
+// AllThumbKeys returns the thumbnail key of every indexed model.
+func (d *DB) AllThumbKeys(ctx context.Context) (map[string]bool, error) {
+	rows, err := d.sql.QueryContext(ctx, `SELECT DISTINCT thumb_key FROM models`)
 	if err != nil {
 		return nil, err
 	}
@@ -1235,20 +1391,20 @@ func (d *DB) summarizedCollections(ctx context.Context, opts CollectionOpts, que
 		return nil, err
 	}
 
-	// Identical files share a thumbnail, so pick distinct hashes. Model
+	// Identical files share a thumbnail, so pick distinct keys. Model
 	// renders come first; images (only when files are shown) fill in after.
 	kinds := `'model'`
 	if opts.IncludeFiles {
 		kinds = `'model', 'file'`
 	}
 	rows, err = d.sql.QueryContext(ctx, treeCTE+`
-		SELECT root, hash FROM (
-			SELECT root, hash, row_number() OVER (PARTITION BY root ORDER BY is_file, first_path) AS n
+		SELECT root, thumb_key FROM (
+			SELECT root, thumb_key, row_number() OVER (PARTITION BY root ORDER BY is_file, first_path) AS n
 			FROM (
-				SELECT tree.root, m.hash, min(m.kind = 'file') AS is_file, min(m.path COLLATE NOCASE) AS first_path
+				SELECT tree.root, m.thumb_key, min(m.kind = 'file') AS is_file, min(m.path COLLATE NOCASE) AS first_path
 				FROM tree JOIN models m ON m.collection_id = tree.id
 				WHERE m.thumb_state = 'ok' AND m.kind IN (`+kinds+`)
-				GROUP BY tree.root, m.hash
+				GROUP BY tree.root, m.thumb_key
 			)
 		) WHERE n <= ? ORDER BY root, n`, append(ids, opts.Previews)...)
 	if err != nil {
@@ -1261,7 +1417,7 @@ func (d *DB) summarizedCollections(ctx context.Context, opts CollectionOpts, que
 			rows.Close()
 			return nil, err
 		}
-		out[idx[id]].PreviewHashes = append(out[idx[id]].PreviewHashes, hash)
+		out[idx[id]].PreviewKeys = append(out[idx[id]].PreviewKeys, hash)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {

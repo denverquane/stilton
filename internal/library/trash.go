@@ -49,6 +49,7 @@ type TrashBatch struct {
 type TrashedMeta struct {
 	Path      string   `json:"path"`
 	Hash      string   `json:"hash,omitempty"`
+	Up        string   `json:"up,omitempty"`
 	Tags      []string `json:"tags,omitempty"`
 	SourceURL string   `json:"sourceUrl,omitempty"`
 }
@@ -78,11 +79,11 @@ func (s *Scanner) trashSelection(ctx context.Context, sel selection, items []Del
 			b.Collections = append(b.Collections, TrashedMeta{Path: c.Path, Tags: c.Tags, SourceURL: c.SourceURL})
 		}
 		for _, m := range ms {
-			b.Models = append(b.Models, TrashedMeta{Path: m.Path, Hash: m.Hash, Tags: m.Tags, SourceURL: m.SourceURL})
+			b.Models = append(b.Models, TrashedMeta{Path: m.Path, Hash: m.Hash, Up: m.Up, Tags: m.Tags, SourceURL: m.SourceURL})
 		}
 	}
 	for _, m := range sel.models {
-		b.Models = append(b.Models, TrashedMeta{Path: m.Path, Hash: m.Hash, Tags: m.Tags, SourceURL: m.SourceURL})
+		b.Models = append(b.Models, TrashedMeta{Path: m.Path, Hash: m.Hash, Up: m.Up, Tags: m.Tags, SourceURL: m.SourceURL})
 	}
 
 	dir := s.batchDir(b.ID)
@@ -205,9 +206,9 @@ func (s *Scanner) listTrash() ([]TrashBatch, error) {
 	return out, nil
 }
 
-// TrashHashes returns the content hashes of models in the trash, whose
+// TrashThumbKeys returns the thumbnail keys of models in the trash, whose
 // thumbnails should be kept for a possible restore.
-func (s *Scanner) TrashHashes() (map[string]bool, error) {
+func (s *Scanner) TrashThumbKeys() (map[string]bool, error) {
 	batches, err := s.Trash()
 	if err != nil {
 		return nil, err
@@ -215,7 +216,7 @@ func (s *Scanner) TrashHashes() (map[string]bool, error) {
 	out := map[string]bool{}
 	for _, b := range batches {
 		for _, m := range b.Models {
-			out[m.Hash] = true
+			out[db.ThumbKey(m.Hash, m.Up)] = true
 		}
 	}
 	return out, nil
@@ -276,6 +277,9 @@ func (s *Scanner) RestoreTrash(ctx context.Context, id string) (TrashBatch, erro
 	for _, m := range b.Models {
 		if id, err := s.DB.ModelIDByPath(ctx, m.Path); err == nil {
 			errs = append(errs, s.DB.SetModelTags(ctx, id, m.Tags), s.DB.SetModelSourceURL(ctx, id, m.SourceURL))
+			if m.Up != "" {
+				errs = append(errs, s.DB.SetModelUp(ctx, id, m.Up))
+			}
 		}
 	}
 	slog.Info("restored from trash", "batch", id, "items", len(b.Items))

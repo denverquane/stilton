@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,6 +35,7 @@ func run() error {
 		dataDir  = flag.String("data", "data", "directory for the database and thumbnails")
 		workers  = flag.Int("workers", 2, "concurrent thumbnail renders (each large mesh can use hundreds of MB)")
 		interval = flag.Duration("rescan", 5*time.Minute, "how often to rescan the library (0 disables)")
+		hosts    = flag.String("hosts", "", "comma-separated extra host names the server is reached by, e.g. nas.home,stlton.example.com (IP addresses, localhost, and this machine's hostname always work)")
 	)
 	flag.Parse()
 	if *libDir == "" {
@@ -61,16 +63,19 @@ func run() error {
 	defer stop()
 
 	thumbs := thumbnail.NewGenerator(database, root, filepath.Join(*dataDir, "thumbs"), *workers)
+	if err := thumbs.EnsureVersion(ctx); err != nil {
+		return err
+	}
 	scanner := &library.Scanner{Root: root, DB: database, OnChange: thumbs.Wake}
 	// Keep thumbnails for indexed models and for models in the trash, so a
 	// restore doesn't have to re-render them.
 	sweep := func() {
 		n, err := thumbs.Sweep(ctx, func(ctx context.Context) (map[string]bool, error) {
-			keep, err := database.AllHashes(ctx)
+			keep, err := database.AllThumbKeys(ctx)
 			if err != nil {
 				return nil, err
 			}
-			trashed, err := scanner.TrashHashes()
+			trashed, err := scanner.TrashThumbKeys()
 			if err != nil {
 				return nil, err
 			}
@@ -97,8 +102,11 @@ func run() error {
 	go scanLoop(ctx, scanner, *interval, sweep)
 
 	srv := &http.Server{
-		Addr:    *addr,
-		Handler: (&server.Server{DB: database, Scanner: scanner, Thumbs: thumbs, Web: web.Dist()}).Handler(),
+		Addr: *addr,
+		Handler: (&server.Server{
+			DB: database, Scanner: scanner, Thumbs: thumbs, Web: web.Dist(),
+			AllowedHosts: strings.Split(*hosts, ","),
+		}).Handler(),
 	}
 	go func() {
 		<-ctx.Done()
